@@ -895,6 +895,15 @@ pub struct Hover {
     pub language: Option<Arc<Language>>,
 }
 
+pub struct DebugHover {
+    pub expression: String,
+    pub range: Range<language::Anchor>,
+    pub result: String,
+    pub type_: Option<String>,
+    pub variables_reference: u64,
+    pub session: Entity<Session>,
+}
+
 impl Hover {
     pub fn is_empty(&self) -> bool {
         self.contents.iter().all(|block| block.text.is_empty())
@@ -4384,6 +4393,56 @@ impl Project {
         let position = position.to_point_utf16(buffer.read(cx));
         self.lsp_store
             .update(cx, |lsp_store, cx| lsp_store.hover(buffer, position, cx))
+    }
+
+    pub fn debug_hover<T: ToOffset>(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: T,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Option<DebugHover>>> {
+        let (session, active_stack_frame) = self.active_debug_session(cx)?;
+        if !session.read(cx).any_stopped_thread() {
+            return None;
+        }
+        if BreakpointStore::abs_path_from_buffer(buffer, cx)
+            .is_none_or(|path| path.as_ref() != active_stack_frame.path.as_ref())
+        {
+            return None;
+        }
+
+        let snapshot = buffer.read(cx).snapshot();
+        let offset = position.to_offset(&snapshot);
+        let (range, expression) = snapshot
+            .debug_variables_query(offset..offset)
+            .filter(|(_, object)| object == &language::DebuggerTextObject::Variable)
+            .filter(|(range, _)| range.start <= offset && offset <= range.end)
+            .min_by_key(|(range, _)| range.end - range.start)
+            .map(|(range, _)| {
+                let expression = snapshot.text_for_range(range.clone()).collect::<String>();
+                let range = snapshot.anchor_before(range.start)..snapshot.anchor_after(range.end);
+                (range, expression)
+            })?;
+
+        if expression.trim().is_empty() {
+            return None;
+        }
+
+        let evaluate = session
+            .read(cx)
+            .evaluate_for_hover(expression.clone(), active_stack_frame.stack_frame_id);
+
+        Some(cx.spawn(async move |_, _| {
+            let response = evaluate.await.log_err()?;
+            Some(DebugHover {
+                expression,
+                range,
+                result: response.result,
+                type_: response.type_,
+                variables_reference: response.variables_reference,
+                session,
+            })
+        }))
     }
 
     pub fn linked_edits(

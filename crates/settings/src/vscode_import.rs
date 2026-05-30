@@ -270,6 +270,7 @@ impl VsCodeSettings {
             gutter: self.gutter_content(),
             horizontal_scroll_margin: None,
             hover_popover_delay: self.read_u64("editor.hover.delay").map(Into::into),
+            debug_hover_popover_enabled: None,
             hover_popover_enabled: self.read_bool("editor.hover.enabled"),
             hover_popover_sticky: self.read_bool("editor.hover.sticky"),
             hover_popover_hiding_delay: self.read_u64("editor.hover.hidingDelay").map(Into::into),

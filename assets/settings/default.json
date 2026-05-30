@@ -119,6 +119,8 @@
   // Whether to show the informational hover box when moving the mouse
   // over symbols in the editor.
   "hover_popover_enabled": true,
+  // Whether to show debugger values in the hover popover when stopped on a stack frame.
+  "debug_hover_popover_enabled": true,
   // Time to wait in milliseconds before showing the informational hover box.
   // This delay also applies to auto signature help when `auto_signature_help` is enabled.
   "hover_popover_delay": 300,

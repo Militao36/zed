@@ -9,22 +9,24 @@ use crate::{
 };
 use anyhow::Context as _;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Bounds, Context, Entity, Focusable as _, FontWeight, Hsla,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, ScrollHandle, Size,
-    StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task, TaskExt,
-    TextStyleRefinement, Window, canvas, div, px,
+    AnyElement, App, AsyncWindowContext, Bounds, ClipboardItem, Context, Entity, Focusable as _,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, Pixels, Render,
+    ScrollHandle, Size, StatefulInteractiveElement, StyleRefinement, Styled, Subscription, Task,
+    TaskExt, TextStyleRefinement, Window, canvas, div, px,
 };
 use itertools::Itertools;
 use language::{DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::{MultiBufferOffset, ToOffset, ToPoint};
-use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
+use project::{DebugHover, HoverBlock, HoverBlockKind, InlayHintLabelPart};
 use settings::Settings;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
 };
+use std::{future::Future, pin::Pin};
 use std::{ops::Range, sync::Arc, time::Duration};
 use std::{path::PathBuf, rc::Rc};
 use theme_settings::ThemeSettings;
@@ -221,6 +223,7 @@ pub fn hover_at_inlay(
                 let hover_popover = InfoPopover {
                     symbol_range: RangeInEditor::Inlay(inlay_hover.range.clone()),
                     parsed_content,
+                    debug_view: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(false)),
                     anchor: None,
@@ -344,7 +347,14 @@ fn show_hover(
                 total_delay
             };
 
+            let include_debug_hover =
+                cx.update(|_, cx| EditorSettings::get_global(cx).debug_hover_popover_enabled)?;
             let hover_request = cx.update(|_, cx| provider.hover(&buffer, buffer_position, cx))?;
+            let debug_hover_request = if include_debug_hover {
+                cx.update(|_, cx| provider.debug_hover(&buffer, buffer_position, cx))?
+            } else {
+                None
+            };
 
             if let Some(delay) = delay {
                 delay.await;
@@ -478,11 +488,40 @@ fn show_hover(
             } else {
                 Vec::new()
             };
+            let debug_hover = if let Some(debug_hover_request) = debug_hover_request {
+                debug_hover_request.await
+            } else {
+                None
+            };
             let snapshot = this.update_in(cx, |this, window, cx| this.snapshot(window, cx))?;
             let mut hover_highlights = Vec::with_capacity(hovers_response.len());
             let mut info_popovers = Vec::with_capacity(
-                hovers_response.len() + if invisible_char.is_some() { 1 } else { 0 },
+                hovers_response.len()
+                    + if invisible_char.is_some() { 1 } else { 0 }
+                    + if debug_hover.is_some() { 1 } else { 0 },
             );
+
+            if let Some(debug_hover) = debug_hover {
+                if let Some(range) = snapshot
+                    .buffer_snapshot()
+                    .buffer_anchor_range_to_anchor_range(debug_hover.range.clone())
+                {
+                    hover_highlights.push(range.clone());
+                    let symbol_range = RangeInEditor::Text(range);
+                    let debug_view =
+                        cx.new_window_entity(|_window, cx| DebugHoverView::new(debug_hover, cx))?;
+                    info_popovers.push(InfoPopover {
+                        symbol_range,
+                        parsed_content: None,
+                        debug_view: Some(debug_view),
+                        scroll_handle: ScrollHandle::new(),
+                        keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
+                        anchor: Some(anchor),
+                        last_bounds: Rc::new(Cell::new(None)),
+                        _subscription: None,
+                    });
+                }
+            }
 
             if let Some((invisible, range)) = invisible_char {
                 let blocks = vec![HoverBlock {
@@ -502,6 +541,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(range),
                     parsed_content,
+                    debug_view: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -565,6 +605,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(range),
                     parsed_content,
+                    debug_view: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -591,6 +632,7 @@ fn show_hover(
                 info_popovers.push(InfoPopover {
                     symbol_range: RangeInEditor::Text(multi_buffer_range),
                     parsed_content,
+                    debug_view: None,
                     scroll_handle,
                     keyboard_grace: Rc::new(RefCell::new(ignore_timeout)),
                     anchor: Some(anchor),
@@ -1025,9 +1067,449 @@ impl HoverState {
     }
 }
 
+pub struct DebugHoverView {
+    expression: String,
+    result: String,
+    type_: Option<String>,
+    variables_reference: u64,
+    session: Entity<project::debugger::session::Session>,
+    expanded: HashSet<Vec<String>>,
+    loading: HashSet<Vec<String>>,
+    loaded: HashMap<Vec<String>, Vec<dap::Variable>>,
+}
+
+const DEBUG_HOVER_COPY_MAX_DEPTH: usize = 6;
+const DEBUG_HOVER_COPY_MAX_CHILDREN: usize = 200;
+
+impl DebugHoverView {
+    fn new(debug_hover: DebugHover, _cx: &mut Context<Self>) -> Self {
+        Self {
+            expression: debug_hover.expression,
+            result: debug_hover.result,
+            type_: debug_hover.type_,
+            variables_reference: debug_hover.variables_reference,
+            session: debug_hover.session,
+            expanded: HashSet::default(),
+            loading: HashSet::default(),
+            loaded: HashMap::default(),
+        }
+    }
+
+    fn toggle(&mut self, path: Vec<String>, variables_reference: u64, cx: &mut Context<Self>) {
+        if variables_reference == 0 {
+            return;
+        }
+
+        if !self.expanded.insert(path.clone()) {
+            self.expanded.remove(&path);
+            cx.notify();
+            return;
+        }
+
+        if self.loaded.contains_key(&path) || self.loading.contains(&path) {
+            cx.notify();
+            return;
+        }
+
+        self.loading.insert(path.clone());
+        let session = self.session.clone();
+        cx.spawn(async move |this, cx| {
+            let variables_task = session.read_with(cx, |session, _| {
+                session.variables_for_hover(variables_reference)
+            });
+            let variables = variables_task.await?;
+            this.update(cx, |this, cx| {
+                this.loading.remove(&path);
+                this.loaded.insert(path, variables);
+                cx.notify();
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+        cx.notify();
+    }
+
+    fn copy_value(&self, value: String, variables_reference: u64, cx: &mut Context<Self>) {
+        if variables_reference == 0 {
+            cx.write_to_clipboard(ClipboardItem::new_string(value));
+            return;
+        }
+
+        let session = self.session.clone();
+        cx.spawn(async move |_, cx| {
+            let value = copy_debug_value(
+                session,
+                value,
+                variables_reference,
+                0,
+                HashSet::default(),
+                cx,
+            )
+            .await;
+            cx.update(|cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(value));
+            });
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn render_variable_rows(
+        &self,
+        variables: &[dap::Variable],
+        parent_path: &[String],
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        const MAX_VALUE_CHARS: usize = 240;
+
+        variables
+            .iter()
+            .flat_map(|variable| {
+                let mut path = parent_path.to_vec();
+                path.push(variable.name.clone());
+                let is_expanded = self.expanded.contains(&path);
+                let is_loading = self.loading.contains(&path);
+                let has_children = variable.variables_reference > 0;
+                let disclosure = if is_loading {
+                    "..."
+                } else if !has_children {
+                    " "
+                } else if is_expanded {
+                    "v"
+                } else {
+                    ">"
+                };
+                let value = truncate_debug_value(&variable.value, MAX_VALUE_CHARS);
+                let raw_value = variable.value.clone();
+                let row_path = path.clone();
+                let variables_reference = variable.variables_reference;
+                let copy_value = raw_value.clone();
+                let row_id = SharedString::from(format!("debug-hover-{}", path.join(".")));
+                let row_group = SharedString::from(format!("{row_id}-group"));
+                let weak_this = cx.weak_entity();
+                let mut rows = vec![
+                    h_flex()
+                        .id(row_id.clone())
+                        .flex()
+                        .gap_1()
+                        .group(row_group.clone())
+                        .pl(px((depth * 12) as f32))
+                        .pr_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .text_ui_sm(cx)
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .when(has_children, |this| {
+                            this.cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle(row_path.clone(), variables_reference, cx);
+                                }))
+                        })
+                        .child(
+                            div()
+                                .w_4()
+                                .flex_none()
+                                .text_center()
+                                .text_color(Color::Muted.color(cx))
+                                .child(disclosure),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_weight(FontWeight::BOLD)
+                                .child(variable.name.clone()),
+                        )
+                        .when_some(variable.type_.clone(), |this, type_| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_color(Color::Muted.color(cx))
+                                    .child(format!(": {type_}")),
+                            )
+                        })
+                        .when(!value.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(Color::Muted.color(cx))
+                                    .child(format!("= {value}")),
+                            )
+                        })
+                        .child(
+                            CopyButton::new(format!("{row_id}-copy"), "")
+                                .tooltip_label(if has_children {
+                                    "Copy Full Value"
+                                } else {
+                                    "Copy Value"
+                                })
+                                .custom_on_click(move |_window, cx| {
+                                    cx.stop_propagation();
+                                    weak_this
+                                        .update(cx, |this, cx| {
+                                            this.copy_value(
+                                                copy_value.clone(),
+                                                variables_reference,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                })
+                                .visible_on_hover(row_group),
+                        )
+                        .into_any_element(),
+                ];
+
+                if is_expanded && let Some(children) = self.loaded.get(&path) {
+                    rows.extend(self.render_variable_rows(children, &path, depth + 1, cx));
+                }
+
+                rows
+            })
+            .collect()
+    }
+}
+
+impl Render for DebugHoverView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let type_suffix = self
+            .type_
+            .as_ref()
+            .filter(|type_| !type_.is_empty())
+            .map(|type_| format!(" ({type_})"))
+            .unwrap_or_default();
+        let root_path = Vec::<String>::new();
+        let root_expanded = self.expanded.contains(&root_path);
+        let root_loading = self.loading.contains(&root_path);
+        let root_disclosure = if root_loading {
+            "..."
+        } else if self.variables_reference == 0 {
+            " "
+        } else if root_expanded {
+            "v"
+        } else {
+            ">"
+        };
+        let root_reference = self.variables_reference;
+        let rows = self
+            .loaded
+            .get(&root_path)
+            .filter(|_| root_expanded)
+            .map(|variables| self.render_variable_rows(variables, &root_path, 1, cx))
+            .unwrap_or_default();
+
+        v_flex()
+            .id("debug-hover")
+            .group("debug-hover")
+            .p_2()
+            .gap_2()
+            .min_w(px(420.))
+            .max_w(px(760.))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .text_ui_sm(cx)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(cx.theme().colors().element_background)
+                                    .text_color(Color::Muted.color(cx))
+                                    .child("Debug"),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .truncate()
+                                    .child(self.expression.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(Color::Muted.color(cx))
+                                    .child(type_suffix),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .child(
+                                CopyButton::new(
+                                    format!("debug-hover-copy-expression-{}", self.expression),
+                                    self.expression.clone(),
+                                )
+                                .tooltip_label("Copy Expression"),
+                            )
+                            .child(
+                                CopyButton::new(
+                                    format!("debug-hover-copy-value-{}", self.expression),
+                                    "",
+                                )
+                                .tooltip_label(if self.variables_reference > 0 {
+                                    "Copy Full Value"
+                                } else {
+                                    "Copy Value"
+                                })
+                                .custom_on_click({
+                                    let value = self.result.clone();
+                                    let variables_reference = self.variables_reference;
+                                    let weak_this = cx.weak_entity();
+                                    move |_window, cx| {
+                                        cx.stop_propagation();
+                                        weak_this
+                                            .update(cx, |this, cx| {
+                                                this.copy_value(
+                                                    value.clone(),
+                                                    variables_reference,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                    }
+                                }),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_ui_sm(cx)
+                    .font_buffer(cx)
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(cx.theme().colors().border.opacity(0.6))
+                    .bg(cx.theme().colors().editor_background.opacity(0.75))
+                    .max_w_full()
+                    .line_height(rems(1.35))
+                    .child(truncate_debug_value(&self.result, 500)),
+            )
+            .when(self.variables_reference > 0, |this| {
+                this.child(
+                    h_flex()
+                        .id("debug-hover-root")
+                        .gap_1()
+                        .px_1()
+                        .py_1()
+                        .rounded_sm()
+                        .text_ui_sm(cx)
+                        .cursor_pointer()
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle(Vec::new(), root_reference, cx);
+                        }))
+                        .child(
+                            div()
+                                .w_4()
+                                .text_color(Color::Muted.color(cx))
+                                .child(root_disclosure),
+                        )
+                        .child(div().font_weight(FontWeight::BOLD).child("Children"))
+                        .child(
+                            div()
+                                .text_color(Color::Muted.color(cx))
+                                .child("Expand object fields"),
+                        ),
+                )
+            })
+            .children(rows)
+    }
+}
+
+fn truncate_debug_value(value: &str, max_chars: usize) -> String {
+    let mut value = value.replace('\n', " ");
+    if value.chars().count() <= max_chars {
+        return value;
+    }
+
+    let mut index = value.len();
+    for (char_count, (byte_index, _)) in value.char_indices().enumerate() {
+        if char_count == max_chars {
+            index = byte_index;
+            break;
+        }
+    }
+    value.truncate(index);
+    value.push_str("...");
+    value
+}
+
+fn copy_debug_value(
+    session: Entity<project::debugger::session::Session>,
+    fallback: String,
+    variables_reference: u64,
+    depth: usize,
+    mut visited: HashSet<u64>,
+    cx: &mut gpui::AsyncApp,
+) -> Pin<Box<dyn Future<Output = String> + '_>> {
+    Box::pin(async move {
+        if variables_reference == 0 {
+            return fallback;
+        }
+
+        if depth >= DEBUG_HOVER_COPY_MAX_DEPTH || !visited.insert(variables_reference) {
+            return fallback;
+        }
+
+        let variables_task = session.read_with(cx, |session, _| {
+            session.variables_for_hover(variables_reference)
+        });
+        let Ok(variables) = variables_task.await else {
+            return fallback;
+        };
+
+        if variables.is_empty() {
+            return fallback;
+        }
+
+        let mut text = String::from("{");
+        for variable in variables.iter().take(DEBUG_HOVER_COPY_MAX_CHILDREN) {
+            text.push('\n');
+            text.push_str(&"  ".repeat(depth + 1));
+            text.push_str(&variable.name);
+            text.push_str(": ");
+
+            if variable.variables_reference > 0 {
+                text.push_str(
+                    &copy_debug_value(
+                        session.clone(),
+                        variable.value.clone(),
+                        variable.variables_reference,
+                        depth + 1,
+                        visited.clone(),
+                        cx,
+                    )
+                    .await,
+                );
+            } else {
+                text.push_str(&variable.value);
+            }
+        }
+
+        if variables.len() > DEBUG_HOVER_COPY_MAX_CHILDREN {
+            text.push('\n');
+            text.push_str(&"  ".repeat(depth + 1));
+            text.push_str("...");
+        }
+
+        text.push('\n');
+        text.push_str(&"  ".repeat(depth));
+        text.push('}');
+        text
+    })
+}
+
 pub struct InfoPopover {
     pub symbol_range: RangeInEditor,
     pub parsed_content: Option<Entity<Markdown>>,
+    pub debug_view: Option<Entity<DebugHoverView>>,
     pub scroll_handle: ScrollHandle,
     pub keyboard_grace: Rc<RefCell<bool>>,
     pub anchor: Option<Anchor>,
@@ -1103,6 +1585,23 @@ impl InfoPopover {
                         .tracked_scroll_handle(&self.scroll_handle),
                     window,
                     cx,
+                )
+            })
+            .when_some(self.debug_view.clone(), |this, debug_view| {
+                this.child(
+                    div()
+                        .id("debug-hover-container")
+                        .overflow_y_scroll()
+                        .max_w(max_size.width)
+                        .max_h(max_size.height)
+                        .track_scroll(&self.scroll_handle)
+                        .child(debug_view)
+                        .custom_scrollbars(
+                            Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
+                                .tracked_scroll_handle(&self.scroll_handle),
+                            window,
+                            cx,
+                        ),
                 )
             })
             .into_any_element()

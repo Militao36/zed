@@ -2812,6 +2812,32 @@ impl Session {
         })
     }
 
+    pub fn evaluate_for_hover(
+        &self,
+        expression: String,
+        frame_id: StackFrameId,
+    ) -> Task<Result<dap::EvaluateResponse>> {
+        self.state.request_dap(EvaluateCommand {
+            expression,
+            context: Some(EvaluateArgumentsContext::Hover),
+            frame_id: Some(frame_id),
+            source: None,
+        })
+    }
+
+    pub fn variables_for_hover(
+        &self,
+        variables_reference: VariableReference,
+    ) -> Task<Result<Vec<dap::Variable>>> {
+        self.state.request_dap(VariablesCommand {
+            variables_reference,
+            filter: None,
+            start: None,
+            count: None,
+            format: None,
+        })
+    }
+
     pub fn location(
         &mut self,
         reference: u64,

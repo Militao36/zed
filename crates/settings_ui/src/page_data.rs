@@ -1813,7 +1813,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn hover_popover_section() -> [SettingsPageItem; 5] {
+    fn hover_popover_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("Hover Popover"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -1824,6 +1824,21 @@ fn editor_page() -> SettingsPage {
                     pick: |settings_content| settings_content.editor.hover_popover_enabled.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.editor.hover_popover_enabled = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Debugger Values",
+                description: "Show debugger values in the hover popover when stopped on a stack frame.",
+                field: Box::new(SettingField {
+                    json_path: Some("debug_hover_popover_enabled"),
+                    pick: |settings_content| {
+                        settings_content.editor.debug_hover_popover_enabled.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content.editor.debug_hover_popover_enabled = value;
                     },
                 }),
                 metadata: None,

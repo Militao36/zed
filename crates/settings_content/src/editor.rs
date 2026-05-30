@@ -48,6 +48,10 @@ pub struct EditorSettingsContent {
     ///
     /// Default: true
     pub hover_popover_enabled: Option<bool>,
+    /// Whether to show debugger values in the hover popover when stopped on a stack frame.
+    ///
+    /// Default: true
+    pub debug_hover_popover_enabled: Option<bool>,
     /// Time to wait in milliseconds before showing the informational hover box.
     /// This delay also applies to auto signature help when `auto_signature_help` is enabled.
     ///

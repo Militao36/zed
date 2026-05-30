@@ -10875,6 +10875,13 @@ pub trait SemanticsProvider {
         cx: &mut App,
     ) -> Option<Task<Option<Vec<project::Hover>>>>;
 
+    fn debug_hover(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<project::DebugHover>>>;
+
     fn inline_values(
         &self,
         buffer_handle: Entity<Buffer>,
@@ -10951,6 +10958,17 @@ impl SemanticsProvider for WeakEntity<Project> {
     ) -> Option<Task<Option<Vec<project::Hover>>>> {
         self.update(cx, |project, cx| project.hover(buffer, position, cx))
             .ok()
+    }
+
+    fn debug_hover(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<project::DebugHover>>> {
+        self.update(cx, |project, cx| project.debug_hover(buffer, position, cx))
+            .ok()
+            .flatten()
     }
 
     fn document_highlights(
